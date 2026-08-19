@@ -2,9 +2,10 @@
 name: whatsapp-messenger
 description: >-
   Send WhatsApp messages to individuals and group chats from a Claude container,
-  by building and pairing the whatsapp-mcp Go bridge in-session. Reach for this
-  when the user asks to send a WhatsApp message, text someone, or post to one
-  of their group chats. Also covers looking up a group's JID by name, since
+  and read back received messages and media, by building and pairing the
+  whatsapp-mcp Go bridge in-session. Reach for this when the user asks to send a
+  WhatsApp message, text someone, post to one of their group chats, or check
+  what someone sent. Also covers looking up a group's JID by name, since
   groups can only be addressed by JID. Setup takes a few minutes and has to be
   redone every session — the container resets, so the build and the WhatsApp
   pairing are both lost between conversations, and the user must re-pair from
@@ -96,9 +97,34 @@ by shell quoting — you'll send something subtly wrong, or get a failure that
 looks like a bridge fault. `wa.py` builds the JSON in Python. Use `--file` for
 anything long or punctuation-heavy.
 
-**The bridge gets reaped between turns.** A backgrounded process often dies
-once the turn ends, so `health` failing on a later turn is normal — restart it
-and resend. Check before assuming something broke.
+**The bridge does not always survive.** It is reaped when the container sits
+idle — a long pause while the user reads or replies will kill it, while rapid
+back-and-forth turns generally will not. Observed: one instance ran ~8 minutes
+across several turns, then died during a two-minute gap. So `health` failing
+later is common but not guaranteed; check rather than assuming either way, and
+restart before any send.
+
+While it is down, nothing is captured. Incoming messages that arrive in that
+window are absent from `store/messages.db` — WhatsApp may requeue them to the
+linked device on reconnect, but do not count on it. Any workflow that waits
+for someone's reply is unreliable for exactly this reason; say so rather than
+promising to watch for one.
+
+## Reading messages and media
+
+Both read `store/messages.db` directly — no bridge required, though only what
+the bridge captured while running is there:
+
+```bash
+python3 scripts/wa.py messages --chat 60123456789 --limit 20
+python3 scripts/wa.py messages --since '2026-08-19 15:00'
+python3 scripts/wa.py media <message_id> --out /tmp/pic.jpg
+```
+
+`media` fetches the `mmg.whatsapp.net` URL stored with the message and
+decrypts it locally, deliberately avoiding the bridge's `/api/download` — see
+below. The output path can then be opened with `view` to actually look at the
+image.
 
 ## Groups
 
@@ -133,15 +159,29 @@ to explain the message to real people.
 
 **Confirm from `success: true`**, not from the absence of an error.
 
-## Known broken: history sync and media
+## History sync, and why media needs the workaround
 
-App-state and history sync fail with 403 — they download from rotating
-`media-*.cdn.whatsapp.net` hosts. Symptoms: no contact names, no chat history,
-media send/receive failing. Text sending is unaffected; it goes over the main
-WebSocket.
+App-state and history sync fail with 403: they download from rotating
+`media-<region>.cdn.whatsapp.net` hosts, and a restricted egress allowlist
+refuses them (`x-deny-reason: host_not_allowed`). Symptoms: no chat history,
+patchy contact names. Push names from history sync usually do land, so contact
+lookup by name often works anyway.
 
-The fix is `*.cdn.whatsapp.net` on the allowlist — wildcards matter, the
-hostnames rotate per connection. User's change to make; mention it and move on.
+The bridge's `/api/download` fails for the same reason — it asks WhatsApp for a
+media connection and is handed one of those rotating hosts. There is no stable
+hostname to allowlist. `wa.py media` sidesteps this: each media message is
+stored with an `mmg.whatsapp.net` URL, a single stable host, so it fetches that
+and decrypts locally (AES-256-CBC, keys derived from the message's `media_key`
+via HKDF-SHA256, 10-byte HMAC trailer). Receiving media therefore works.
+
+Two limits remain. The stored URL carries an `oe=` expiry, so media from older
+messages eventually 404s and has to be re-sent. And *sending* media still
+uploads to a blocked host — text only, outbound.
+
+Adding `*.cdn.whatsapp.net` to the allowlist would fix history sync and
+outbound media properly. Wildcards matter; the hostnames rotate per
+connection. It is the user's change to make, and it only applies to containers
+started afterwards, so they need a fresh conversation. Mention it and move on.
 
 ## Account risk
 
