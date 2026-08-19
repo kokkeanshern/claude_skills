@@ -1,45 +1,81 @@
 /**
- * Trip Planner Bridge
- * A minimal JSON endpoint so Claude can read and write your travel sheets
- * without your laptop needing to be on.
+ * Sheets Bridge
+ * A minimal JSON endpoint so an agent can read and write Google Sheets
+ * without a browser session or a machine being awake.
+ *
+ * This file contains no secrets and is safe to commit as-is. All config
+ * lives in Script Properties.
  *
  * SETUP
- *   1. Open your Planner sheet -> Extensions -> Apps Script
- *   2. Delete the placeholder code, paste this whole file in
- *   3. Change TOKEN below to a long random string of your own
- *   4. Deploy -> New deployment -> type: Web app
+ *   1. script.google.com -> New project, paste this file in
+ *   2. Project Settings (gear) -> Script Properties -> add two properties:
+ *
+ *        TOKEN     a long random string, e.g. from `uuidgen`
+ *        ALLOWED   a JSON object mapping short keys to spreadsheet IDs:
+ *                  {"main":"1AbC...","scratch":"1XyZ..."}
+ *
+ *      The ID is the long segment in a sheet URL between /d/ and /edit.
+ *
+ *   3. Deploy -> New deployment -> type: Web app
  *        Execute as:      Me
  *        Who has access:  Anyone
- *      ("Anyone" is required for a server to reach it. The TOKEN is what
- *       actually protects it — that is why it must not be guessable.)
- *   5. Authorise when prompted, then copy the /exec URL
+ *      ("Anyone" is required for a server to reach it. TOKEN is what
+ *       actually protects it - that is why it must not be guessable.)
+ *   4. Authorise when prompted, then copy the /exec URL
+ *
+ * AFTER ANY CODE EDIT
+ *   Deploy -> Manage deployments -> edit -> Version: New version.
+ *   Saving alone does not change what the /exec URL serves.
  *
  * SECURITY NOTES
- *   - This endpoint can ONLY touch the spreadsheets listed in ALLOWED below.
+ *   - This endpoint can ONLY touch the spreadsheets listed in ALLOWED.
  *     It is not a general key to your Drive.
  *   - Reads are unrestricted; writes are capped at MAX_CELLS per call.
  *   - Revoke at any time: Deploy -> Manage deployments -> Archive.
- *   - Rotate by changing TOKEN and redeploying.
+ *   - Rotate by changing the TOKEN property. No redeploy needed - script
+ *     properties are read per request, not baked into the version.
  */
 
 // ---------------------------------------------------------------- config
 
-const TOKEN = '';
-
-const ALLOWED = {
-  planner: '',
-  dummy:   '' 
-};
-
 const MAX_CELLS = 5000;   // guard against a runaway write
 const LOG_TAB   = null;   // set to a tab name (e.g. '_log') to record every write
+
+/** Secrets live in Script Properties, never in this file. */
+function config() {
+  var props = PropertiesService.getScriptProperties();
+  var token = props.getProperty('TOKEN');
+  var rawAllowed = props.getProperty('ALLOWED');
+
+  if (!token) {
+    throw new Error('not configured: set the TOKEN script property');
+  }
+  if (!rawAllowed) {
+    throw new Error('not configured: set the ALLOWED script property');
+  }
+
+  var allowed;
+  try {
+    allowed = JSON.parse(rawAllowed);
+  } catch (err) {
+    throw new Error('ALLOWED script property is not valid JSON');
+  }
+  if (!allowed || typeof allowed !== 'object' || Array.isArray(allowed)) {
+    throw new Error('ALLOWED must be a JSON object, e.g. {"main":"1AbC..."}');
+  }
+  if (!Object.keys(allowed).length) {
+    throw new Error('ALLOWED is empty - add at least one spreadsheet');
+  }
+
+  return { token: token, allowed: allowed };
+}
 
 // ---------------------------------------------------------------- routing
 
 function doGet() {
   return json({
     ok: true,
-    service: 'trip-planner-bridge',
+    service: 'sheets-bridge',
     note: 'Alive. POST a JSON body with a valid token to use.'
   });
 }
@@ -57,17 +93,20 @@ function doPost(e) {
       return json({ ok: false, error: 'body was not valid JSON' });
     }
 
-    if (!req.token || req.token !== TOKEN) {
+    var cfg = config();
+
+    if (!req.token || req.token !== cfg.token) {
       return json({ ok: false, error: 'bad or missing token' });
     }
 
-    var book = req.book || 'planner';
-    var id = ALLOWED[book];
+    var keys = Object.keys(cfg.allowed);
+    var book = req.book || keys[0];
+    var id = cfg.allowed[book];
     if (!id) {
       return json({
         ok: false,
         error: 'unknown book: ' + book,
-        allowed: Object.keys(ALLOWED)
+        allowed: keys
       });
     }
 
@@ -78,11 +117,12 @@ function doPost(e) {
       case 'read':   return json(opRead(ss, req));
       case 'write':  return json(opWrite(ss, req));
       case 'append': return json(opAppend(ss, req));
+      case 'addTab': return json(opAddTab(ss, req));
       default:
         return json({
           ok: false,
           error: 'unknown op: ' + req.op,
-          ops: ['ping', 'read', 'write', 'append']
+          ops: ['ping', 'read', 'write', 'append', 'addTab']
         });
     }
 
@@ -132,7 +172,7 @@ function opRead(ss, req) {
  * write { tab, startCell, values }
  * values is a 2D array. The target range is derived from its dimensions,
  * so you never have to hand-compute an A1 range that matches.
- *   e.g. { tab:'Itinerary', startCell:'B14', values:[['9.00am','Breakfast']] }
+ *   e.g. { tab:'Sheet1', startCell:'B14', values:[['9.00am','Breakfast']] }
  */
 function opWrite(ss, req) {
   var sheet = mustGetTab(ss, req.tab);
@@ -166,7 +206,7 @@ function opWrite(ss, req) {
 /**
  * append { tab, values }
  * Adds rows below the last populated row. Safer than write for adding
- * itinerary items, since it cannot overwrite anything.
+ * records, since it cannot overwrite anything.
  */
 function opAppend(ss, req) {
   var sheet = mustGetTab(ss, req.tab);
@@ -184,6 +224,81 @@ function opAppend(ss, req) {
     tab: sheet.getName(),
     appendedRange: target.getA1Notation(),
     rowsAppended: values.length
+  };
+}
+
+/**
+ * addTab { tab, headers?, index?, copyFrom? }
+ * Creates a new tab. Refuses if the name is already taken, so it can never
+ * clobber or rename an existing tab — same spirit as append vs write.
+ *   tab       name of the new tab
+ *   headers   optional 1D array written to row 1, bolded and frozen
+ *   index     optional 0-based position in the tab strip; default is last
+ *   copyFrom  optional existing tab to clone layout and formatting from
+ *             (note: this copies the source tab's data as well)
+ */
+function opAddTab(ss, req) {
+  var name = String(req.tab == null ? '' : req.tab).trim();
+
+  if (!name) throw new Error('addTab requires a non-empty "tab"');
+  if (name.length > 100) {
+    throw new Error('tab name too long (Sheets allows 100 characters)');
+  }
+  if (ss.getSheetByName(name)) {
+    throw new Error(
+      'tab "' + name + '" already exists — nothing was created. Existing: ' +
+      ss.getSheets().map(function (s) { return s.getName(); }).join(', ')
+    );
+  }
+
+  // Position: clamp into range, default to the end of the tab strip.
+  var total = ss.getNumSheets();
+  var pos = total;
+  if (req.index !== undefined && req.index !== null && req.index !== '') {
+    var wanted = Number(req.index);
+    if (isNaN(wanted)) throw new Error('"index" must be a number');
+    pos = Math.min(Math.max(0, Math.floor(wanted)), total);
+  }
+
+  // Optional: clone an existing tab's layout and formatting.
+  var template = null;
+  if (req.copyFrom) {
+    template = mustGetTab(ss, req.copyFrom);
+  }
+
+  var sheet = template
+    ? ss.insertSheet(name, pos, { template: template })
+    : ss.insertSheet(name, pos);
+
+  // Optional header row.
+  var headers = null;
+  if (req.headers !== undefined && req.headers !== null) {
+    if (!Array.isArray(req.headers) || Array.isArray(req.headers[0])) {
+      throw new Error('"headers" must be a 1D array, e.g. ["Day","Time"]');
+    }
+    if (req.headers.length) {
+      headers = req.headers.map(function (h) { return h == null ? '' : h; });
+      var row = sheet.getRange(1, 1, 1, headers.length);
+      row.setValues([headers]);
+      row.setFontWeight('bold');
+      sheet.setFrozenRows(1);
+    }
+  }
+
+  SpreadsheetApp.flush();
+  writeLog(ss, 'addTab', name, headers ? 'row 1' : '', headers ? headers.length : 0);
+
+  return {
+    ok: true,
+    created: name,
+    index: sheet.getIndex(),        // 1-based, as shown in the tab strip
+    gid: sheet.getSheetId(),
+    url: ss.getUrl() + '#gid=' + sheet.getSheetId(),
+    maxRows: sheet.getMaxRows(),    // allocated grid, not populated rows
+    maxCols: sheet.getMaxColumns(),
+    headers: headers,
+    copiedFrom: req.copyFrom || null,
+    tabs: ss.getSheets().map(function (s) { return s.getName(); })
   };
 }
 
