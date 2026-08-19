@@ -1,6 +1,6 @@
 # claude_skills
 
-Generic Claude skills.
+Generic Claude skills. TBH mostly written by Claude itself...
 
 | Skill | What it does |
 |---|---|
