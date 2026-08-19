@@ -35,6 +35,10 @@ fi
 
 echo "==> Adding helpers (not in upstream)"
 mkdir -p "$BRIDGE/cmd/pairer" "$BRIDGE/cmd/groups"
+
+# pairer/bridge open store/whatsapp.db without creating the directory first,
+# so a fresh clone panics on "unable to open database file".
+mkdir -p "$BRIDGE/store"
 cp "$SKILL_DIR/patches/pairer/main.go" "$BRIDGE/cmd/pairer/main.go"
 cp "$SKILL_DIR/patches/groups/main.go" "$BRIDGE/cmd/groups/main.go"
 
