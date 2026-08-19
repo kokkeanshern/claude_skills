@@ -219,3 +219,10 @@ __marimo__/
 
 # Sheets Bridge: packaged skill zips and any bridge.py with real credentials
 sheets_bridge/*.zip
+
+# whatsapp_bridge
+store/
+*.db
+.bridge-token
+whatsapp-mcp/
+whatsapp_bridge/*.zip
